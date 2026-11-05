@@ -1,0 +1,39 @@
+# R stuff
+.Rhistory
+.RData
+.RDataTmp
+.Rproj.user/
+.Renviron
+.Renviron.local
+.Rprofile
+.Rproj.user/
+.Ruserdata
+.Rbuildignore
+*.Rproj
+
+# Python
+.env
+.venv
+venv/
+
+# Stan
+# Stan compiled models (rstan auto_write cache)
+code/experiment2/stan/*.rds
+
+# knitr / R output
+*_files/
+Rplots.pdf
+
+# OS files
+.DS_Store
+
+# RStudio and VSCode
+.vscode/
+
+/doc/figs/*.pdf
+*.jpg
+*.jpeg
+
+# Indesign
+*.ai
+
