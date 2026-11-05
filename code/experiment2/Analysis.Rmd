@@ -1,0 +1,1406 @@
+---
+title: "Bayesian modeling of room-acoustic memory with
+same and different speech signals"
+subtitle: "Analysis Script with figures for publication"
+author: "Sergio de las Heras"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    math_method: katex
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+This RMarkdown script reproduces the analysis of Experiment 2. It
+produces the figures that appear in the publication.
+
+This script is meant to be knitted from its own folder
+(`code/experiment2`), so all paths are relative to it.
+
+# Setup
+
+The figures use the Latin Modern Roman font if it is installed, and the
+default serif font otherwise. The package `sdlhRTools` provides
+`geom_violinhist()`, used in the descriptive plots.
+
+```{r setup, message = FALSE}
+library(tidyverse)
+library(patchwork)
+library(rstan)
+library(bayesplot)
+library(tidybayes)
+library(tm)
+library(sdlhRTools)
+
+# Set to TRUE to overwrite the figures in doc/figs
+savePlots <- FALSE
+
+# Set to TRUE to fit the Stan models again instead of loading the saved fits
+refit <- FALSE
+
+dataDir <- "../../data"
+figDir  <- "../../doc/figs"
+stanDir <- "stan"
+
+
+# STAN FIT
+# Use multicore if possible and autosave the compiled Stan programs
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+set.seed(123)
+
+# PLOTS
+# Use Latin Modern Roman when it is installed, otherwise default to serif font
+hasPaperFont <- "LMRoman10-Regular" %in% systemfonts::system_fonts()$name
+paperFont <- if (hasPaperFont) "LM Roman 10" else "serif"
+
+if (hasPaperFont && capabilities("aqua")) {
+  quartzFonts(`LM Roman 10` = quartzFont(
+    paste0("LMRoman10-", c("Regular", "Bold", "Italic", "BoldItalic"))
+  ))
+}
+
+# Common theme of the paper figures
+theme_paper <- function(base_size = 10) {
+  theme_minimal(base_family = paperFont, base_size = base_size)
+}
+
+speechColours <- c("Same speech" = "#548665", "Different speech" = "#BD7A3B")
+
+# Save a figure to doc/figs (sizes in cm), only when savePlots is TRUE.
+savePaperFig <- function(plot, file, width, height) {
+  if (savePlots) {
+    ggsave(file.path(figDir, file), plot = plot,
+           width = width, height = height, units = "cm",
+           device = if (capabilities("aqua")) {
+             function(filename, ...) quartz(type = "pdf", file = filename, ...)
+           } else {
+             cairo_pdf
+           })
+  }
+}
+```
+
+# Data
+
+The experiment data are in two files:
+
+- `experimentResults.csv`: one row per trial, with the columns
+  - `ParticipantID`, `SetNo`: participant ID and set (1 to 3),
+  - `SpeakerCondition`: same speech (`SS`) or different speech (`DS`),
+  - `Communities`: room communities of the two rooms of the trial (`A`,
+    `B`, `C`, or a pair such as `A-B`),
+  - `RoomCondition`: same room (`SR`) or different rooms (`DR`),
+  - `deltaT`: retention interval in seconds,
+  - `RoomA`, `RoomB`: identifiers of the rooms of the first and second
+    sound,
+  - `AudioA`, `AudioB`: speech samples of the first and second sound,
+  - `T20A`, `T20B`: mid-frequency reverberation time of the two rooms in
+    seconds,
+  - `Response`: answer of the participant, same room (`SR`) or different
+    rooms (`DR`),
+  - `isSame`: 1 if both sounds were in the same room,
+  - `saySame`: 1 if the participant answered "same room",
+  - `correctFlag`, `type`: whether the answer was correct, and its
+    signal detection category (`hit`, `miss`, `fa`, `cr`),
+  - `Attr1`–`Attr4`: optional free-text attributes given by the
+    participant.
+- `surveys.csv`: one row per participant with the answers to the
+  questionnaires.
+
+```{r}
+attrCols <- c("Attr1", "Attr2", "Attr3", "Attr4")
+
+data <- read.csv(file.path(dataDir, "experimentResults.csv")) %>%
+  mutate(
+    sameSpeaker   = ifelse(SpeakerCondition == "DS", 0, 1),
+    hasAttributes = rowSums(!is.na(across(all_of(attrCols)))) > 0
+  )
+
+surveyData <- read.csv(file.path(dataDir, "surveys.csv"))
+
+tibble(
+  participants = n_distinct(data$ParticipantID),
+  trials       = nrow(data)
+)
+```
+
+## Participants
+
+Summary and demographic data.
+
+```{r}
+surveyData %>% count(Gender)
+
+surveyData %>%
+  summarize(
+    Age.mean   = mean(Age, na.rm = TRUE),
+    Age.median = median(Age, na.rm = TRUE),
+    Age.sd     = sd(Age, na.rm = TRUE),
+    across(
+      c(focus01, focus02, focus03,
+        confidence01, confidence02, confidence03,
+        AcouTraining, AcouResearch,
+        ListeningTestExperience, Difficulty),
+      list(mean = ~ mean(.x, na.rm = TRUE),
+           sd   = ~ sd(.x, na.rm = TRUE)),
+      .names = "{.col}.{.fn}"
+    )
+  ) %>%
+  pivot_longer(everything(), names_to = "Statistic", values_to = "Value") %>%
+  knitr::kable(digits = 2, align = "lr", caption = "Survey summary")
+```
+
+Strategy that each participant reported for the task (free text).
+
+```{r}
+surveyData %>% select(ParticipantID, Approach)
+```
+
+## Attributes
+
+Participants could describe with up to four words what changed between
+the two sounds. The words are spelled freely, so variants and typos of
+the same concept are first mapped to one category with the dictionary
+below. Then punctuation, numbers and stop words are removed, and the
+categories are counted.
+
+```{r}
+text_data <- unlist(lapply(data[c("Attr1", "Attr2", "Attr3", "Attr4")], function(x) {
+  x <- x[!is.na(x) & x != ""]
+  as.character(x)
+}))
+
+dict <- list(
+  reverberation = c(
+    "reverb","rev","reverberant","reverberation","reverberance",
+    "reverbration","reverbrant","revberant","reverbery","reverbs",
+    "reverbe","reveberant","rverb","reverbrant","rt","rt60","t60","revertb","reberb"
+  ),
+  echo = c(
+    "echoy","echo","echoes","eco","pong","pingpong","ping","kaiku"
+  ),
+  room = c("room","roomy","roomier","space","spatial","spacious","acoustic","acoustics","acustic"),
+  dry = c("dry","drier","dryer","dryness"),
+  wet = c("wet","wetter"),
+  loudness = c("loud","louder","loudness","quieter","softer","volume","level","intensity"),
+  brightness = c("brightness","bright","brighter","darker","high","higher","higer","low","lower","llower","colder","warmer","warm","open","full","fuller","richer"),
+  timbre = c(
+    "timbre","tone","tonal","tonality","color","colour","coloration","colouration",
+    "timbefr","colorisation","muffled", "mufffled", "muffle","muted","metallic","hollow","hollowness"
+  ),
+  distance = c(
+    "distance","far","farther","further","away","distant","near","nearer","closer","coser","distamce","proximity"
+  ),
+  direction = c("direction","directional","left","right","panning","side","behind","towards","orientation"),
+  localization = c("location", "lcation", "localization","localised","local","loc","locaization","llocal","position","placement","centered"
+  ),
+  size = c("size","smaller","bigger","larger","width","wider","massive","huge","smaler","lager"),
+  decay = c("decay","tail","tails","longer","shorter","shjorter","shrter","loger","duration","time","length"),
+  drr = c("drr","ratio","direct"),
+  resonance = c("resonance","resonant","resonances","ressonance","ringing","modes","mode","modal"),
+  clarity = c("clarity","clear","clearer","crisp","sharp","sharper","blurrier","focused","focus","intelligibility","intellegibility","intellgibility"),
+  bass = c("bass","bassier","boomy","boomier","mids", "bommy"),
+  earlyreflections = c("reflections","reflection","refections"),
+  stereo = c("stereo","stero","image","enveloping"),
+  source = c("source","speaker","voice","mic","listener", "osurce","souce"),
+  frequency = c("frequency","freq","freqs","frequncy","spectrum","spectral"),
+  diffuseness = c("diffused","diffuseness","difuseness","diffusedness"),
+  combfiltering = c("combfiltered","combfilterin","combfiter"),
+  damping = c("damping","damped","dampened","attenuation","absorbed"),
+  change = c(
+    "different","difference","diff","diffe","differet","differnt","diffrent","diiferent",
+    "changed","change","seems","seemed","slightly","slighty","sightly","slighlty",
+    "sliightly","sllightly","slughtly","sighlty"
+  )
+)
+
+map_words <- content_transformer(function(x) {
+  for (k in names(dict)) {
+    pattern <- paste0("\\b(", paste(dict[[k]], collapse = "|"), ")\\b")
+    x <- gsub(pattern, k, x, perl = TRUE)
+  }
+  x
+})
+
+custom_stop <- c("one","bit","much","second","2nd","2ndone","1st","2ns","two","way","maybe","think","felt","feeling","feels","good","just", "also", "change", "less")
+
+
+corpus <- VCorpus(VectorSource(text_data)) %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(content_transformer(function(x) gsub("[[:punct:]]+", " ", x))) %>%
+  tm_map(map_words) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, c(stopwords("en"), custom_stop)) %>%
+  tm_map(stripWhitespace)
+
+dtm <- DocumentTermMatrix(corpus)
+
+attribute_freq <- tibble(
+  attribute = colnames(dtm),
+  count     = colSums(as.matrix(dtm))
+) %>%
+  arrange(desc(count))
+
+head(attribute_freq, 10)
+```
+
+## General performance
+
+Overall performance is the proportion of correct answers of each
+participant across all trials of the experiment, summarised across
+participants.
+
+```{r}
+participantPerformance <- data %>%
+  group_by(ParticipantID) %>%
+  summarise(propCorrect = mean(correctFlag), nTrials = n())
+
+participantPerformance %>%
+  summarise(
+    mean   = mean(propCorrect),
+    median = median(propCorrect),
+    sd     = sd(propCorrect),
+    min    = min(propCorrect),
+    max    = max(propCorrect)
+  )
+```
+
+### Performance by set
+
+Each participant did three sets of trials. The proportion of correct
+answers is computed per participant and set.
+
+```{r}
+setPerformance <- data %>%
+  group_by(ParticipantID, SetNo) %>%
+  summarise(propCorrect = mean(correctFlag), .groups = "drop") %>%
+  mutate(SetNo = factor(SetNo, labels = paste("Set", 1:3)))
+
+setPerformance %>%
+  group_by(SetNo) %>%
+  summarise(
+    mean = mean(propCorrect),
+    sd   = sd(propCorrect),
+    N    = n()
+  )
+```
+
+The figure shows, per set and over all sets, the distribution of the
+participants' proportions of correct answers: a half violin with a
+histogram, a boxplot, and the mean (diamond).
+
+```{r, fig.width = 10 / 2.54, fig.height = 7 / 2.54}
+# Layers shared by the performance figures
+performanceLayers <- list(
+  geom_violinhist(scale = "area", nudge_value = 0.03, binwidth = 0.05),
+  geom_boxplot(width = 0.09, alpha = 0.3),
+  stat_summary(geom = "point", fun = "mean", size = 1, shape = 5),
+  ylim(0.4, 1),
+  theme_paper(),
+  theme(legend.position = "none")
+)
+
+bySetPlot <- ggplot(setPerformance, aes(x = SetNo, y = propCorrect, fill = SetNo)) +
+  performanceLayers +
+  labs(x = "Set number", y = "Proportion of correct answers")
+
+allSetsPlot <- ggplot(setPerformance, aes(x = "", y = propCorrect, fill = "All")) +
+  performanceLayers +
+  scale_fill_manual(values = c(All = "steelblue")) +
+  labs(x = "All", y = NULL) +
+  theme(axis.text.y = element_blank())
+
+propCorrectFig <- bySetPlot + allSetsPlot + plot_layout(widths = c(2, 1))
+
+propCorrectFig
+savePaperFig(propCorrectFig, "exp2_propCorrect.pdf", width = 10, height = 7)
+```
+
+### Performance by retention interval
+
+```{r}
+timePerformance <- data %>%
+  group_by(ParticipantID, deltaT) %>%
+  summarise(propCorrect = mean(correctFlag), .groups = "drop") %>%
+  group_by(deltaT) %>%
+  mutate(N = n()) %>%
+  ungroup() %>%
+  mutate(deltaT = factor(deltaT))
+
+ggplot(timePerformance, aes(x = deltaT, y = propCorrect, fill = deltaT)) +
+  performanceLayers +
+  geom_text(
+    data = distinct(timePerformance, deltaT, N),
+    aes(label = paste0("N=", N), y = Inf),
+    position = position_nudge(x = -0.2),
+    vjust = 1.2, size = 3, family = paperFont
+  ) +
+  labs(x = "Retention interval (s)", y = "Proportion of correct answers")
+```
+
+Mean and SD of the proportion of correct answers per retention interval,
+over both speech conditions and for each of them.
+
+```{r}
+conditionPerformance <- data %>%
+  group_by(ParticipantID, deltaT, SpeakerCondition) %>%
+  summarise(propCorrect = mean(correctFlag), .groups = "drop") %>%
+  group_by(deltaT, SpeakerCondition) %>%
+  summarise(mean = mean(propCorrect), sd = sd(propCorrect), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = SpeakerCondition,
+    values_from = c(mean, sd),
+    names_glue  = "{.value}{SpeakerCondition}"
+  )
+
+performanceByDeltaT <- timePerformance %>%
+  group_by(deltaT) %>%
+  summarise(mean = mean(propCorrect), sd = sd(propCorrect), N = n()) %>%
+  mutate(deltaT = as.numeric(as.character(deltaT))) %>%
+  left_join(conditionPerformance, by = "deltaT") %>%
+  select(deltaT, N, mean, sd, meanSS, sdSS, meanDS, sdDS)
+
+knitr::kable(performanceByDeltaT, digits = 3)
+```
+
+## Between-community trials
+
+Most trials compared two rooms of the same community (A-A, B-B or C-C).
+In addition, each participant did one different-speech, different-room
+trial of each between-community pair (A-B, A-C and B-C) per retention
+interval. The proportion of correct answers of the between-community
+pairs is compared with the pooled within-community trials of the
+different-speech condition.
+
+```{r}
+dataSameCommunities <- data %>%
+  filter(!Communities %in% c("A-B", "B-C", "A-C")) %>%
+  filter(SpeakerCondition == "DS")
+
+timePerformanceSameCommunities <- dataSameCommunities %>%
+  group_by(deltaT,correctFlag) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = correctFlag, values_from = count, values_fill = 0) %>%
+  mutate(
+    propCorrect = `TRUE` / (`TRUE`+`FALSE`),
+  )  %>%
+  mutate(
+    deltaT = factor(deltaT, levels=sort(unique(deltaT)), )
+  )
+
+meanValuesDifferentCommunitiesAB <- data %>%
+  filter(Communities == "A-B") %>%
+  group_by(ParticipantID, deltaT,correctFlag) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = correctFlag, values_from = count, values_fill = 0) %>%
+  mutate(
+    propCorrect = `TRUE` / (`TRUE`+`FALSE`),
+  )  %>%
+  mutate(
+    deltaT = factor(deltaT, levels=sort(unique(deltaT)), )
+  ) %>% aggregate(propCorrect ~ deltaT, data = ., FUN = mean)
+
+meanValuesDifferentCommunitiesAC <- data %>%
+  filter(Communities == "A-C") %>%
+  group_by(ParticipantID, deltaT,correctFlag) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = correctFlag, values_from = count, values_fill = 0) %>%
+  mutate(
+    propCorrect = `TRUE` / (`TRUE`+`FALSE`),
+  )  %>%
+  mutate(
+    deltaT = factor(deltaT, levels=sort(unique(deltaT)), )
+  ) %>% aggregate(propCorrect ~ deltaT, data = ., FUN = mean)
+
+meanValuesDifferentCommunitiesBC <- data %>%
+  filter(Communities == "B-C") %>%
+  group_by(ParticipantID, deltaT,correctFlag) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = correctFlag, values_from = count, values_fill = 0) %>%
+  mutate(
+    propCorrect = `TRUE` / (`TRUE`+`FALSE`),
+  )  %>%
+  mutate(
+    deltaT = factor(deltaT, levels=sort(unique(deltaT)), )
+  ) %>% aggregate(propCorrect ~ deltaT, data = ., FUN = mean)
+
+# Performance averaged over retention intervals (dotted lines in the figure)
+pooled_avg_propCorrect <- bind_rows(
+  tibble(community = "AA, BB or CC", y = mean(timePerformanceSameCommunities$propCorrect)),
+  tibble(community = "A-B",          y = mean(meanValuesDifferentCommunitiesAB$propCorrect)),
+  tibble(community = "A-C",          y = mean(meanValuesDifferentCommunitiesAC$propCorrect)),
+  tibble(community = "B-C",          y = mean(meanValuesDifferentCommunitiesBC$propCorrect))
+)
+
+pooled_avg_propCorrect
+```
+
+```{r, fig.width = 10 / 2.54, fig.height = 8 / 2.54}
+plot2 <- timePerformanceSameCommunities %>%
+  ggplot(aes(x=deltaT, y=propCorrect))+
+  geom_hline(
+    data = pooled_avg_propCorrect,
+    aes(yintercept = y, color = community),
+    alpha = 0.7,
+    linetype = "dotted",
+    linewidth = 0.6
+  )+
+  geom_line(
+    data = timePerformanceSameCommunities,
+    aes(x = deltaT, y = propCorrect, group = 1, color = "AA, BB or CC"),
+    linewidth = 0.6,
+    alpha = 0.2,
+    linetype = 2
+  ) +
+  geom_line(
+    data = meanValuesDifferentCommunitiesAB,
+    aes(x = deltaT, y = propCorrect, group = 1, color = "A-B"),
+    linewidth = 0.6,
+    alpha = 0.2
+  ) +
+  geom_line(
+    data = meanValuesDifferentCommunitiesAC,
+    aes(x = deltaT, y = propCorrect, group = 1, color = "A-C"),
+    linewidth = 0.6,
+    alpha = 0.2
+  ) +
+  geom_line(
+    data = meanValuesDifferentCommunitiesBC,
+    aes(x = deltaT, y = propCorrect, group = 1, color = "B-C"),
+    linewidth = 0.6,
+    alpha = 0.2
+  ) +
+  geom_point(data = timePerformanceSameCommunities, aes(x=deltaT, y=propCorrect, color = "AA, BB or CC"),shape = 18, size = 3 , position = position_nudge(x = 0)) +
+  geom_point(data = meanValuesDifferentCommunitiesAB, aes(x=deltaT, y=propCorrect, color = "A-B"),shape = 18, size = 4, position = position_nudge(x = -0.08)) +
+  geom_point(data = meanValuesDifferentCommunitiesAC, aes(x=deltaT, y=propCorrect, color = "A-C"),shape = 18, size = 4) +
+  geom_point(data = meanValuesDifferentCommunitiesBC, aes(x=deltaT, y=propCorrect, color = "B-C"),shape = 18, size = 4, position = position_nudge(x = 0.08)) +
+  xlab("Retention Interval (s)") +
+  ylab("Prop. of correct answers") +
+  theme_minimal(base_family = paperFont) +
+  theme(
+        axis.title.x = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank()
+  ) +
+  scale_color_manual(
+    name = "Communities",
+    breaks = c("A-B", "A-C", "B-C", "AA, BB or CC"),
+    values = c(
+      "AA, BB or CC" = "lightgray",
+      "A-B" = "#726F6E",
+      "A-C" = "#8EBE7E",
+      "B-C" = "#D6A43B"
+    )
+  ) +
+  guides(
+    color = guide_legend(ncol = 2, byrow = TRUE)
+  ) +
+  scale_x_discrete(expand = expansion(add = 0.3)) +
+  theme(
+    legend.position = "bottom",
+    legend.justification = "left",
+    legend.box.just = "left",
+    legend.text  = element_text(size = 8),
+    legend.title = element_blank(),
+  )
+
+print(plot2)
+
+savePaperFig(plot2, "exp2_propCorrectCommunities.pdf", width = 10, height = 8)
+```
+
+Proportion of different-speech trials in which participants wrote at
+least one attribute.
+
+```{r}
+data %>%
+  filter(SpeakerCondition == "DS") %>%
+  mutate(between = Communities %in% c("A-B", "A-C", "B-C")) %>%
+  group_by(between) %>%
+  summarise(
+    propWithAttributes          = mean(hasAttributes)
+  )
+```
+
+## Empirical sensitivity
+
+For each participant, speech condition and retention interval, the
+sensitivity $d'$ and the criterion $c$ are computed from the hit rate
+(HR) and the false alarm rate (FAR) of the within-community trials:
+
+$$d' = \Phi^{-1}(\mathrm{HR}) - \Phi^{-1}(\mathrm{FAR}), \qquad
+c = -\frac{\Phi^{-1}(\mathrm{HR}) + \Phi^{-1}(\mathrm{FAR})}{2}.$$
+
+Rates of 0 and 1 are corrected to $1/(2M)$ and $1 - 1/(2M)$, with $M$
+the number of trials of the rate.
+
+```{r}
+dataSameCommunitiesSS <- data %>%
+  filter(!Communities %in% c("A-B", "B-C", "A-C")) %>%
+  filter(SpeakerCondition == "SS")
+
+timePerformanceSameCommunitiesSS <- dataSameCommunitiesSS %>%
+  group_by(ParticipantID, deltaT, type) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = type, values_from = count, values_fill = 0) %>%
+  mutate(
+    hr = hit / (hit + miss),
+    hr = ifelse(hr == 0, 1/(2*(hit+miss)), hr),
+    hr = ifelse(hr == 1, 1-1/(2*(hit+miss)), hr),
+    far = fa/(fa+cr),
+    far = ifelse(far == 0, 1/(2*(fa+cr)), far),
+    far = ifelse(far == 1, 1-1/(2*(fa+cr)), far),
+    zhr = qnorm(hr),
+    zfar = qnorm(far),
+    dprime = zhr-zfar,
+    crit = -(zhr + zfar) / 2,
+  ) %>%
+  group_by(deltaT) %>%
+  mutate(N = n()) %>%
+  ungroup() %>%
+  mutate(deltaT = factor(deltaT))
+
+dataSameCommunitiesDS <- data %>%
+  filter(!Communities %in% c("A-B", "B-C", "A-C")) %>%
+  filter(SpeakerCondition == "DS")
+
+timePerformanceSameCommunitiesDS <- dataSameCommunitiesDS %>%
+  group_by(ParticipantID, deltaT, type) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = type, values_from = count, values_fill = 0) %>%
+  mutate(
+    hr = hit / (hit + miss),
+    hr = ifelse(hr == 0, 1/(2*(hit+miss)), hr),
+    hr = ifelse(hr == 1, 1-1/(2*(hit+miss)), hr),
+    far = fa/(fa+cr),
+    far = ifelse(far == 0, 1/(2*(fa+cr)), far),
+    far = ifelse(far == 1, 1-1/(2*(fa+cr)), far),
+    zhr = qnorm(hr),
+    zfar = qnorm(far),
+    dprime = zhr-zfar,
+    crit = -(zhr + zfar) / 2,
+  ) %>%
+  group_by(deltaT) %>%
+  mutate(N = n()) %>%
+  ungroup() %>%
+  mutate(deltaT = factor(deltaT))
+```
+
+Mean and SD of $d'$ per retention interval.
+
+```{r}
+dprimeSummarySS <- timePerformanceSameCommunitiesSS %>%
+  group_by(deltaT) %>%
+  summarise(
+    dprime.mean = mean(dprime, na.rm = TRUE),
+    dprime.sd   = sd(dprime, na.rm = TRUE),
+    N           = n()
+  )
+
+dprimeSummaryDS <- timePerformanceSameCommunitiesDS %>%
+  group_by(deltaT) %>%
+  summarise(
+    dprime.mean = mean(dprime, na.rm = TRUE),
+    dprime.sd   = sd(dprime, na.rm = TRUE),
+    N           = n()
+  )
+
+dprimeSummarySS
+dprimeSummaryDS
+```
+
+Distribution of the participants' $d'$ per retention interval, with the
+same-speech condition on the right and the different-speech condition on
+the left of each retention interval.
+
+```{r, fig.width = 20 / 2.54, fig.height = 8 / 2.54}
+dprimeFig <- ggplot() +
+  # SS
+  geom_violinhist(
+    data = timePerformanceSameCommunitiesSS,
+    mapping = aes(x = deltaT, y = dprime, fill = "Same speech"),
+    scale = "area", nudge_value = 0.06, binwidth = 0.25,
+    hist_color = "grey", hist_alpha = 0, hist_side_flip = TRUE, hist_linewidth = 0.2
+  ) +
+  geom_boxplot(
+    data = timePerformanceSameCommunitiesSS,
+    mapping = aes(x = deltaT, y = dprime, fill = "Same speech"),
+    linewidth = 0.25, width = 0.06, alpha = 0.3,
+    position = position_nudge(x = 0.06)
+  ) +
+  stat_summary(
+    data = timePerformanceSameCommunitiesSS,
+    mapping = aes(x = deltaT, y = dprime),
+    geom = "point", fun = "mean", size = 1, shape = 5,
+    position = position_nudge(x = 0.06)
+  ) +
+  # DS
+  geom_violinhist(
+    data = timePerformanceSameCommunitiesDS,
+    mapping = aes(x = deltaT, y = dprime, fill = "Different speech"),
+    side = "left", scale = "area", nudge_value = 0.06, binwidth = 0.25,
+    hist_color = "grey", hist_alpha = 0, hist_side_flip = TRUE, hist_linewidth = 0.2
+  ) +
+  geom_boxplot(
+    data = timePerformanceSameCommunitiesDS,
+    mapping = aes(x = deltaT, y = dprime, fill = "Different speech"),
+    linewidth = 0.25, width = 0.06, alpha = 0.3,
+    position = position_nudge(x = -0.06)
+  ) +
+  stat_summary(
+    data = timePerformanceSameCommunitiesDS,
+    mapping = aes(x = deltaT, y = dprime),
+    geom = "point", fun = "mean", size = 1, shape = 5,
+    position = position_nudge(x = -0.06)
+  ) +
+  # Number of participants per retention interval
+  geom_text(
+    data = distinct(timePerformanceSameCommunitiesSS, deltaT, N),
+    aes(x = deltaT, label = paste0("N=", N), y = Inf),
+    position = position_nudge(x = -0.2),
+    vjust = 1.2, size = 3.5, family = paperFont
+  ) +
+  scale_fill_manual(name = "Speech condition", values = speechColours) +
+  guides(fill = guide_legend(override.aes = list(alpha = 0.6))) +
+  labs(x = "Retention interval (s)", y = "Estimated d'") +
+  theme_paper() +
+  theme(
+    legend.position        = "inside",
+    legend.position.inside = c(0.03, 0.03),
+    legend.justification   = c("left", "bottom"),
+    legend.title           = element_text(size = 8),
+    legend.text            = element_text(size = 7),
+    legend.key.size        = unit(0.4, "lines"),
+    legend.spacing.y       = unit(0.1, "lines"),
+    legend.background      = element_rect(fill = scales::alpha("white", 0.7), colour = NA),
+    legend.margin          = margin(1, 1, 1, 1)
+  )
+
+dprimeFig
+savePaperFig(dprimeFig, "exp2_dprimeTimeSplit.pdf", width = 20, height = 8)
+```
+
+# Bayesian signal detection model
+
+Each trial $i$, with participant $j$ and speech condition $k$, is modeled as
+a signal detection judgement. $r_i = 1$ if the participant answered
+"same room", and $X_i = 1$ if both rooms were the same. The criterion
+$c_j$ sets the false alarm rate, and the familiarity $d'_{jk}$ elicited
+by the first room decays with the retention interval $\Delta t$
+following the power-law function $\delta$, with $\delta = 1$ at
+$\Delta t = 0$.
+
+$$\begin{aligned}
+r_i &\sim \operatorname{Bernoulli}(p_i) \\[1ex]
+p_i &= \Phi(-c_j + d'_{jk} X_i \delta_k(\Delta t)) \\
+\delta_k(\Delta t)&= \frac{a_k}{a_k + (\Delta t)^{b_k}} \\[3ex]
+&\text{Participant level} \\[1ex]
+c_j &\sim \mathcal{N}(\beta^{\text{crit}}, \sigma^{\text{crit}}) \\
+d'_{jk} &\sim \mathcal{N}(\beta^{\text{fam}}_k, \sigma^{\text{fam}}) \\[3ex]
+&\text{Population level, parameter priors} \\[1ex]
+\beta^{\text{fam}}_{k=\mathrm{SS}} &\sim \mathcal{N}(4,1), \\
+\beta^{\text{fam}}_{k=\mathrm{DS}} &\sim \mathcal{N}(2,1), \\
+\sigma^{\text{fam}} &\sim \operatorname{Log\text{-}Normal}(-0.5,0.2), \\[1ex]
+\beta^{\text{crit}} &\sim \mathcal{N}(1,1), \\
+\sigma^{\text{crit}} &\sim \operatorname{Log\text{-}Normal}(-0.5,0.2), \\[1ex]
+a_k &\sim \operatorname{Log\text{-}Normal}(2, 1), \\
+b_k &\sim \operatorname{Half\text{-}Normal}(0,1).
+\end{aligned}$$
+
+The model is implemented in `stan/room-acoustic-memory.stan`. In the
+Stan model and in the parameter names below, the speech condition index
+is $k = 1$ for different speech (DS) and $k = 2$ for same speech (SS).
+
+The model is fitted to the within-community trials only.
+
+```{r}
+dataSameCommunities <- data %>%
+  filter(!Communities %in% c("A-B", "B-C", "A-C"))
+
+n_participants <- length(unique(dataSameCommunities$ParticipantID))
+N = nrow(dataSameCommunities)
+
+# Prepare the data list
+stan_data <- list(N = nrow(dataSameCommunities),
+                  X = dataSameCommunities$isSame ,
+                  R = dataSameCommunities$saySame,
+                  K_speech = 2,
+                  k_speech = (dataSameCommunities$sameSpeaker+1),
+                  deltaT = dataSameCommunities$deltaT,
+                  J_participants = n_participants,
+                  pid = dataSameCommunities$ParticipantID,
+                  prior_only = 0)
+
+stanFile <- file.path(stanDir, "room-acoustic-memory.stan")
+```
+
+## Prior predictive check
+
+Sample the same model with `prior_only = 1`: the responses are ignored
+and the draws come from the priors only. Each draw of `y_rep` is a full
+simulated experiment.
+
+The fits are saved next to the Stan model and reloaded in a new run. Set
+`refit <- TRUE` in the setup to fit them again.
+
+```{r}
+fitPriorFile <- "room-acoustic-memory_prior.rds"
+
+if (refit || !file.exists(fitPriorFile)) {
+  fit_prior <- stan(
+    file = stanFile,
+    data = modifyList(stan_data, list(prior_only = 1)),
+    iter = 1000,
+    chains = 4,
+    seed = 123,
+    save_warmup = FALSE)
+  saveRDS(fit_prior, fitPriorFile)
+} else {
+  fit_prior <- readRDS(fitPriorFile)
+}
+
+```
+
+Prior draws of the population parameters.
+
+```{r fig.width = 20 / 2.54, fig.height = 16 / 2.54}
+popPars <- c("beta_fam[1]", "beta_fam[2]", "sigma_fam",
+             "beta_crit", "sigma_crit",
+             "a_decay[1]", "a_decay[2]", "b_decay[1]", "b_decay[2]")
+
+# Panel titles as plotmath expressions
+parLabels <- as_labeller(c(
+  "beta_fam[1]" = 'beta[k=="DS"]^fam',
+  "beta_fam[2]" = 'beta[k=="SS"]^fam',
+  "sigma_fam"   = "sigma^fam",
+  "beta_crit"   = "beta^crit",
+  "sigma_crit"  = "sigma^crit",
+  "a_decay[1]"  = 'a[k=="DS"]',
+  "a_decay[2]"  = 'a[k=="SS"]',
+  "b_decay[1]"  = 'b[k=="DS"]',
+  "b_decay[2]"  = 'b[k=="SS"]'
+), default = label_parsed)
+
+# Common x range for the parameters
+xLims <- tibble(
+  parameter = factor(c("beta_fam[1]", "beta_fam[2]", "sigma_fam", "sigma_crit",
+                       "a_decay[1]", "a_decay[2]", "b_decay[1]", "b_decay[2]"),
+                     levels = popPars),
+  lo = 0,
+  hi = c(6, 6, 1, 1, 50, 50, 2, 2))
+xLimsLong <- pivot_longer(xLims, c(lo, hi), values_to = "value")
+
+# One panel per parameter
+plotLayout <- "
+AABBCC
+DD##EE
+FFFGGG
+HHHIII
+"
+
+priorParsPlotData <- as.data.frame(as.matrix(fit_prior, pars = popPars)) %>%
+  pivot_longer(everything(), names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = popPars)) %>%
+  left_join(xLims, by = "parameter") %>%
+  group_by(parameter) %>%
+  filter(value <= quantile(value, 0.99), is.na(hi) | between(value, lo, hi)) %>%
+  ungroup()
+
+priorParsPlot <- wrap_plots(lapply(popPars, function(par) {
+  ggplot(filter(priorParsPlotData, parameter == par), aes(x = value)) +
+    geom_density(fill = "grey70", alpha = 0.6, colour = NA) +
+    geom_blank(data = filter(xLimsLong, parameter == par),
+               aes(x = value), inherit.aes = FALSE) +
+    facet_wrap(~ parameter, labeller = parLabels) +
+    labs(x = NULL, y = NULL) +
+    theme_minimal(base_family = paperFont, base_size = 10) +
+    theme(axis.text.y = element_blank(), strip.text = element_text(size = 12))
+}), design = plotLayout)
+
+print(priorParsPlot)
+savePaperFig(priorParsPlot, "exp2_priorParsPlot.pdf", width = 20, height = 16)
+```
+
+Each simulated experiment is summarised as P(say "same") per condition,
+trial type and retention interval, and compared with the observed data.
+
+```{r fig.width = 20 / 2.54, fig.height = 9 / 2.54}
+y_prior <- rstan::extract(fit_prior, pars = "y_rep")$y_rep   # draws x trials
+
+priorPred <- as_tibble(t(y_prior[sample(nrow(y_prior), 2000), ]),
+                       .name_repair = ~ paste0("draw", seq_along(.x))) %>%
+  bind_cols(dataSameCommunities %>% select(sameSpeaker, isSame, deltaT)) %>%
+  pivot_longer(starts_with("draw"), names_to = "draw", values_to = "saySame") %>%
+  group_by(draw, sameSpeaker, isSame, deltaT) %>%
+  summarise(pSame = mean(saySame), .groups = "drop")
+
+observed <- dataSameCommunities %>%
+  group_by(sameSpeaker, isSame, deltaT) %>%
+  summarise(pSame = mean(saySame), .groups = "drop")
+
+priorPredPlot <- ggplot(priorPred, aes(x = factor(deltaT), y = pSame)) +
+  stat_interval(.width = c(0.5, 0.8, 0.95), point_interval = "median_hdci") +  # prior predictive
+  geom_point(data = observed, colour = "black") +           # observed data
+  facet_grid(isSame ~ sameSpeaker,
+             labeller = labeller(isSame = c(`0` = "Different room trials", `1` = "Same room trials"),
+                                 sameSpeaker = c(`0` = "Different speech", `1` = "Same speech"))) +
+  scale_color_brewer() +
+  labs(x = "Retention interval (s)", y = "P(saySame)", colour = "HPD interval") +
+  theme_minimal(base_family = paperFont, base_size = 10)
+
+print(priorPredPlot)
+savePaperFig(priorPredPlot, "exp2_priorPredPlot.pdf", width = 20, height = 9)
+```
+
+### Prior decay function
+
+The decay parameters $a$ and $b$ have the same prior in both conditions,
+so the prior decay function is identical for DS and SS. The draws of
+both conditions are pooled into a single curve.
+
+```{r fig.width = 20 / 2.54, fig.height = 9 / 2.54}
+priorDecay <- as.data.frame(as.matrix(fit_prior, pars = c("a_decay", "b_decay"))) %>%
+  slice_sample(n = 4000) %>%
+  mutate(draw = row_number()) %>%
+  pivot_longer(-draw,
+               names_to = c(".value", "k"),
+               names_pattern = "(.)_decay\\[(\\d)\\]") %>%
+  crossing(deltaT = seq(0, 16, length.out = 100)) %>%
+  mutate(decay = a / (a + deltaT^b))
+
+priorDecayPlot <- ggplot(priorDecay, aes(x = deltaT, y = decay)) +
+  stat_lineribbon(.width = c(0.5, 0.8, 0.95), point_interval = "median_hdci") +
+  scale_fill_brewer() +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "Retention interval (s)", y = "Decay", fill = "HPD interval") +
+  theme_minimal(base_family = paperFont, base_size = 10)
+
+print(priorDecayPlot)
+savePaperFig(priorDecayPlot, "exp2_priorDecayPlot.pdf", width = 20, height = 9)
+```
+
+## Fitting the model
+
+```{r}
+fitFile <- "room-acoustic-memory_fit.rds"
+
+if (refit || !file.exists(fitFile)) {
+  fit <- stan(
+    file = stanFile,
+    data = stan_data,
+    iter = 4000,
+    chains = 4,
+    seed = 123,
+    save_warmup = FALSE,
+    pars = "y_rep", include = FALSE)
+  saveRDS(fit, fitFile)
+} else {
+  fit <- readRDS(fitFile)
+}
+```
+
+### Convergence diagnostics
+
+$\hat{R}$ and effective sample size of all parameters, and the trace
+plots of the population-level parameters.
+
+```{r}
+rhatESS <- data.frame(summary(fit)$summary[, c("Rhat", "n_eff")])
+
+c(maxRhat = max(rhatESS$Rhat, na.rm = TRUE),
+  minESS  = min(rhatESS$n_eff, na.rm = TRUE))
+```
+
+```{r}
+mcmc_trace(
+  rstan::extract(fit, permuted = FALSE, inc_warmup = FALSE),
+   pars = c("beta_crit", "sigma_crit", "a_decay[1]", "b_decay[1]", "a_decay[2]", "b_decay[2]", "beta_fam[1]", "beta_fam[2]", "sigma_fam")
+)
+```
+
+## Posterior predictive check
+
+`gqs()` reruns only the `generated quantities` block of the model on a
+subset of the posterior draws, giving simulated experiments from the
+fitted model.
+
+```{r fig.width = 20 / 2.54, fig.height = 9 / 2.54}
+model <- stan_model(stanFile)
+
+draws <- as.matrix(fit, pars = c("beta_crit", "sigma_crit", "beta_fam", "sigma_fam",
+                                     "z_crit", "z_fam", "a_decay", "b_decay"))
+draws <- draws[sample(nrow(draws), 2000), ]
+
+gq     <- gqs(model, data = stan_data, draws = draws, seed = 123)
+y_post <- rstan::extract(gq, pars = "y_rep")$y_rep    # draws x trials
+
+postPred <- as_tibble(t(y_post),
+                      .name_repair = ~ paste0("draw", seq_along(.x))) %>%
+  bind_cols(dataSameCommunities %>% select(sameSpeaker, isSame, deltaT)) %>%
+  pivot_longer(starts_with("draw"), names_to = "draw", values_to = "saySame") %>%
+  group_by(draw, sameSpeaker, isSame, deltaT) %>%
+  summarise(pSame = mean(saySame), .groups = "drop")
+
+postPredPlot <- ggplot(postPred, aes(x = factor(deltaT), y = pSame)) +
+  stat_interval(.width = c(0.5, 0.8, 0.95), point_interval = "median_hdci") +  # posterior predictive
+  geom_point(data = observed, colour = "black") +           # observed data
+  facet_grid(isSame ~ sameSpeaker,
+             labeller = labeller(isSame = c(`0` = "Different room trials", `1` = "Same room trials"),
+                                 sameSpeaker = c(`0` = "Different speech", `1` = "Same speech"))) +
+  scale_color_brewer() +
+  labs(x = "Retention interval (s)", y = "P(saySame)", colour = "HPD interval") +
+  theme_minimal(base_family = paperFont, base_size = 10)
+
+print(postPredPlot)
+savePaperFig(postPredPlot, "exp2_posteriorPredPlot.pdf", width = 20, height = 9)
+```
+
+## Prior to posterior comparison
+
+How much the data updated each population parameter: prior and posterior
+distributions overlaid.
+
+```{r fig.width = 20 / 2.54, fig.height = 16 / 2.54}
+# popPars, xLims, xLimsLong and plotLayout are defined in the prior
+# predictive check
+priorPost <- bind_rows(
+  Prior     = as.data.frame(as.matrix(fit_prior, pars = popPars)),
+  Posterior = as.data.frame(as.matrix(fit,   pars = popPars)),
+  .id = "stage"
+) %>%
+  pivot_longer(-stage, names_to = "parameter", values_to = "value") %>%
+  mutate(parameter = factor(parameter, levels = popPars),
+         stage     = factor(stage, levels = c("Prior", "Posterior")))
+
+
+priorPostPlotData <- priorPost %>%
+  left_join(xLims, by = "parameter") %>%
+  group_by(parameter) %>%
+  filter(value <= quantile(value, 0.99), is.na(hi) | between(value, lo, hi)) %>%
+  ungroup()
+
+priorPostPlot <- wrap_plots(lapply(popPars, function(par) {
+  ggplot(filter(priorPostPlotData, parameter == par), aes(x = value, fill = stage)) +
+    geom_density(alpha = 0.6, colour = NA) +
+    geom_blank(data = filter(xLimsLong, parameter == par),
+               aes(x = value), inherit.aes = FALSE) +
+    facet_wrap(~ parameter, labeller = parLabels) +
+    scale_fill_manual(values = c(Prior = "grey70", Posterior = "#3182bd")) +
+    labs(x = NULL, y = NULL, fill = NULL) +
+    theme_minimal(base_family = paperFont, base_size = 10) +
+    theme(axis.text.y = element_blank(), strip.text = element_text(size = 12))
+}), design = plotLayout, guides = "collect") &
+  theme(legend.position = "bottom")
+
+print(priorPostPlot)
+savePaperFig(priorPostPlot, "exp2_priorPostPlot.pdf", width = 20, height = 16)
+```
+
+# Posterior results
+
+Posterior draws of the population-level parameters, and quantities
+derived from them.
+
+```{r}
+posterior <- as.matrix(fit, pars = c("beta_crit", "sigma_crit", "a_decay[1]", "b_decay[1]", "a_decay[2]", "b_decay[2]", "beta_fam[1]", "beta_fam[2]", "sigma_fam"))
+
+# Posterior transformations
+
+posterior <- cbind(posterior, "loga_decay[1]" = log(posterior[, "a_decay[1]"]))
+posterior <- cbind(posterior, "loga_decay[2]" = log(posterior[, "a_decay[2]"]))
+
+posterior <- cbind(posterior, "beta_fam_diff" = posterior[, "beta_fam[2]"] - posterior[, "beta_fam[1]"])
+posterior <- cbind(posterior, "a_diff" = posterior[, "a_decay[2]"] - posterior[, "a_decay[1]"])
+posterior <- cbind(posterior, "b_diff" = posterior[, "b_decay[2]"] - posterior[, "b_decay[1]"])
+
+posterior <- cbind(posterior, "loga_diff" = posterior[, "loga_decay[2]"] - posterior[, "loga_decay[1]"])
+```
+
+## Parameter estimates
+
+Posterior mean and 95% and 80% highest posterior density intervals
+(HPDI) of the parameters and derived quantities.
+
+```{r}
+pars <- c("beta_crit",
+          "sigma_crit",
+          "loga_decay[1]",
+          "a_decay[1]",
+          "b_decay[1]",
+          "loga_decay[2]",
+          "a_decay[2]",
+          "b_decay[2]",
+          "beta_fam[1]",
+          "beta_fam[2]",
+          "sigma_fam",
+          "beta_fam_diff",
+          "a_diff",
+          "loga_diff",
+          "b_diff")
+
+summ_tbl <- lapply(pars, function(p) {
+  x <- as.numeric(posterior[, p])
+  # Drop non-finite if needed
+  x <- x[is.finite(x)]
+  hd95 <- bayestestR::hdi(x, ci = 0.95)  # returns data.frame with CI_low, CI_high
+  hd80 <- bayestestR::hdi(x, ci = 0.80)
+  data.frame(
+    parameter = p,
+    mean      = mean(x),
+    hpdi95_low  = hd95$CI_low,
+    hpdi95_high = hd95$CI_high,
+    hpdi80_low  = hd80$CI_low,
+    hpdi80_high = hd80$CI_high
+  )
+}) %>% bind_rows()
+
+knitr::kable(summ_tbl, digits = 3)
+```
+
+Posterior densities of the main model parameters, with the mean and the
+80% (thick) and 95% (thin) HPDIs.
+
+```{r, fig.width = 10 / 2.54, fig.height = 8 / 2.54}
+pars <- c(
+  "beta_crit",
+  "sigma_crit",
+  "loga_decay[1]",
+  "b_decay[1]",
+  "loga_decay[2]",
+  "b_decay[2]",
+  "beta_fam[1]",
+  "beta_fam[2]",
+  "sigma_fam"
+)
+
+# Convert to a tidy draws data frame, then pivot long for tidybayes
+draws_df <- posterior::as_draws_df(posterior) %>%
+  select(all_of(pars)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>%
+  mutate(
+    parameter = factor(
+      parameter,
+      levels = pars
+    )
+  )
+
+rowLims <- c(1, length(pars) + 0.7)
+
+plotHalfeye <- ggplot(draws_df, aes(x = value, y = parameter)) +
+  stat_halfeye(
+    .width = c(0.8, 0.95),
+    point_interval = "mean_hdi",
+    slab_alpha = 0.7,
+    normalize = "panels"
+  ) +
+  scale_y_discrete(labels = c(
+    "beta_fam[1]"   = expression(beta[k=="DS"]^fam),
+    "beta_fam[2]"   = expression(beta[k=="SS"]^fam),
+    "sigma_fam"     = expression(sigma^fam),
+    "loga_decay[1]" = expression(log(a[k=="DS"])),
+    "loga_decay[2]" = expression(log(a[k=="SS"])),
+    "b_decay[1]"    = expression(b[k=="DS"]),
+    "b_decay[2]"    = expression(b[k=="SS"]),
+    "beta_crit"     = expression(beta^crit),
+    "sigma_crit"    = expression(sigma^crit)
+  )) +
+  scale_x_continuous(breaks = seq(0, 4.5, by = 0.5)) +
+  coord_cartesian(xlim = c(0, 4.5), ylim = rowLims) +
+  theme_minimal(base_family = paperFont, base_size = 10) +
+  theme(
+    panel.grid.major.x = element_line(linewidth = 0.15, colour = "grey85"),
+    panel.grid.major.y = element_line(linewidth = 0.15, colour = "grey85")
+  )
+
+print(plotHalfeye)
+
+savePaperFig(plotHalfeye, "exp2_parameterEstimatesRaw.pdf", width = 10, height = 8)
+```
+
+The same figure with the values of the table on the side (paper figure).
+
+```{r, fig.width = 20 / 2.54, fig.height = 9 / 2.54}
+estimateValues <- summ_tbl %>%
+  filter(parameter %in% pars) %>%
+  transmute(
+    parameter = factor(parameter, levels = pars),
+    Mean = sprintf("%.3f", mean),
+    `80% HPDI` = sprintf("[%.3f, %.3f]", hpdi80_low, hpdi80_high),
+    `95% HPDI` = sprintf("[%.3f, %.3f]", hpdi95_low, hpdi95_high)
+  ) %>%
+  pivot_longer(-parameter, names_to = "column", values_to = "label") %>%
+  mutate(column = factor(column, levels = c("Mean", "80% HPDI", "95% HPDI")))
+
+estimateTable <- ggplot(estimateValues, aes(x = column, y = parameter, label = label)) +
+  geom_text(family = paperFont, size = 3) +
+  scale_x_discrete(position = "top") +
+  coord_cartesian(ylim = rowLims) +
+  labs(x = NULL, y = NULL) +
+  theme_void(base_family = paperFont, base_size = 10) +
+  theme(axis.text.x.top = element_text(margin = margin(b = 4)))
+
+estimatesFig <- plotHalfeye + labs(x = NULL, y = NULL) +
+  theme(axis.text.y = element_text(colour = "black", size = 11)) +
+  estimateTable +
+  plot_layout(widths = c(1.2, 1))
+
+print(estimatesFig)
+
+savePaperFig(estimatesFig, "exp2_parameterEstimatesTable.pdf", width = 20, height = 9)
+```
+
+## Contrasts between speech conditions
+
+Posterior contrasts SS - DS of $\beta^{\text{fam}}$, $\log(a)$ and $b$,
+with the mean and the 80% and 95% HPDIs.
+
+```{r, fig.width = 10 / 2.54, fig.height = 7 / 2.54}
+d_beta <- posterior %>%
+  spread_draws(beta_fam_diff) %>%
+  transmute(parameter = "beta_fam   .", value = beta_fam_diff)
+
+xlim_beta <- 3
+
+p_beta <- ggplot(d_beta, aes(x = value, y = parameter, fill = parameter)) +
+  tidybayes::stat_halfeye(
+    .width = c(0.8, 0.95),
+    point_interval = "mean_hdi",
+    alpha = 0.7,
+    fill = "grey70"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey30") +
+  scale_x_continuous(limits = c(-xlim_beta, xlim_beta)) +
+  labs(x = "Contrast beta_fam (SS - DS)", y = NULL) +
+  theme_minimal(base_family = paperFont, base_size = 9)+
+  theme(legend.position = "none")
+
+# Plot 2: a_diff
+d_a <- posterior %>%
+  spread_draws(loga_diff) %>%
+  transmute(parameter = "a", value = loga_diff)
+
+xlim_a <- 3
+
+p_a <- ggplot(d_a, aes(x = value, y = parameter, fill = parameter)) +
+  tidybayes::stat_halfeye(
+    .width = c(0.8, 0.95),
+    point_interval = "mean_hdi",
+    alpha = 0.7,
+    fill = "grey70"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey30") +
+  scale_x_continuous(limits = c(-xlim_a, xlim_a)) +
+  labs(x = "Contrast a (SS - DS)", y = NULL) +
+  theme_minimal(base_family = paperFont, base_size = 9)+
+  theme(legend.position = "none")
+
+# Plot 3: b_diff
+d_b <- posterior %>%
+  spread_draws(b_diff) %>%
+  transmute(parameter = "b", value = b_diff)
+
+xlim_b <- xlim_a
+
+p_b <- ggplot(d_b, aes(x = value, y = parameter, fill = parameter)) +
+  tidybayes::stat_halfeye(
+    .width = c(0.8, 0.95),
+    point_interval = "mean_hdi",
+    alpha = 0.7,
+    fill = "grey70"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey30") +
+  scale_x_continuous(limits = c(-xlim_b, xlim_b)) +
+  labs(x = "Contrast b (SS - DS)", y = NULL) +
+  theme_minimal(base_family = paperFont, base_size = 9)+
+  theme(legend.position = "none")
+
+# Stack and save
+stacked <- p_beta / p_a / p_b
+print(stacked)
+
+savePaperFig(stacked, "exp2_contrasts_raw.pdf", width = 10, height = 7)
+```
+
+## Decay curves
+
+Decay functions $\delta_k(\Delta t)$ with the posterior mean and the 95%
+HPDI at each retention interval.
+
+```{r, fig.width = 20 / 2.54, fig.height = 8 / 2.54}
+# Extract draws
+ps <- as.data.frame(rstan::extract(fit, pars = c("a_decay", "b_decay")))
+a1 <- ps$a_decay.1; b1 <- ps$b_decay.1
+a2 <- ps$a_decay.2; b2 <- ps$b_decay.2
+
+deltaT <- seq(0, 17, length.out = 200)
+
+# Summaries per x for each condition
+summ_one <- function(a, b, condition) {
+  out <- lapply(deltaT, function(dt) {
+    v <- a / (a + dt^b)
+    h95 <- bayestestR::hdi(v, ci = 0.95)
+    h80 <- bayestestR::hdi(v, ci = 0.80)
+    tibble(
+      deltaT = dt,
+      median = median(v),
+      mean   = mean(v),
+      lo80   = h80$CI_low,
+      hi80   = h80$CI_high,
+      lo95   = h95$CI_low,
+      hi95   = h95$CI_high
+      )
+  }) |> bind_rows()
+  out$condition <- condition
+  out
+}
+
+summ <- bind_rows(
+  summ_one(a1, b1, "Different Speech"),
+  summ_one(a2, b2, "Same Speech")
+)
+
+# Plot: 95% band + mean line
+savePlot <- ggplot() +
+  # 95% band
+  geom_ribbon(data = summ, aes(x = deltaT, ymin = lo95, ymax = hi95, fill = condition),
+              alpha = 0.4, color = NA) +
+  # Mean line
+  geom_line(data = summ, aes(x = deltaT, y = mean, color = condition), linewidth = 0.8) +
+  labs(x = "Retention Interval (s)", y = "Memory decay function") +
+  scale_color_manual(values = c("Different Speech" = "#BD7A3B", "Same Speech" = "#548665")) +
+  scale_fill_manual(values  = c("Different Speech" = "#BD7A3B", "Same Speech" = "#548665")) +
+  theme_minimal(base_family = paperFont, base_size = 11)+
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.98, 0.98),   # inside, top-right
+    legend.justification = c(1, 1),
+    legend.background = element_rect(
+      fill = scales::alpha("white", 0.7),     # semi-transparent box
+      color = NA
+    ),
+    legend.key = element_rect(fill = NA, color = NA),
+    legend.title = element_text(size = 10),
+    legend.text  = element_text(size = 9),
+    legend.margin = margin(2, 4, 2, 4)
+  )
+
+show(savePlot)
+
+savePaperFig(savePlot, "exp2_decayCurves2.pdf", width = 20, height = 8)
+```
+
+Decay functions scaled by the population-level familiarity,
+$\beta^{\text{fam}}_k \times \delta_k(\Delta t)$: the expected
+population-level familiarity at retention interval $\Delta t$, with the
+posterior mean and the 95% HPDI.
+
+```{r, fig.width = 20 / 2.54, fig.height = 10 / 2.54}
+# Extract draws
+ps <- as.data.frame(rstan::extract(fit, pars = c("a_decay", "b_decay", "beta_fam", "sigma_fam")))
+a1 <- ps$a_decay.1; b1 <- ps$b_decay.1
+a2 <- ps$a_decay.2; b2 <- ps$b_decay.2
+beta1 <- ps$beta_fam.1
+beta2 <- ps$beta_fam.2
+
+deltaT <- seq(0, 17, length.out = 200)
+
+summaryDecays <- function(a, b, beta, condition) {
+  out <- lapply(deltaT, function(dt) {
+    delta <- a / (a + dt^b)     # per-draw decay
+    dprime <- beta * delta      # Decay times beta_fam
+
+    h95 <- bayestestR::hdi(dprime, ci = 0.95)
+
+    tibble(
+      deltaT = dt,
+      median = median(dprime),
+      mean   = mean(dprime),
+      lo95   = h95$CI_low,
+      hi95   = h95$CI_high
+    )
+  }) |> bind_rows()
+  out$condition <- condition
+  out
+}
+
+summ <- bind_rows(
+  summaryDecays(a1, b1, beta1, "Different Speech"),
+  summaryDecays(a2, b2, beta2, "Same Speech")
+)
+
+savePlot <- ggplot() +
+  geom_ribbon(
+    data = summ,
+    aes(x = deltaT, ymin = lo95, ymax = hi95, fill = condition),
+    alpha = 0.4, color = NA
+  ) +
+  geom_line(
+    data = summ,
+    aes(x = deltaT, y = mean, color = condition),
+    linewidth = 1
+  ) +
+  labs(x = "Retention Interval (s)", y = "beta_fam x delta(retention interval)") +
+  scale_color_manual(values = c("Different Speech" = "#BD7A3B", "Same Speech" = "#548665")) +
+  scale_fill_manual(values  = c("Different Speech" = "#BD7A3B", "Same Speech" = "#548665")) +
+  theme_minimal(base_family = paperFont, base_size = 10) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.98, 0.98),
+    legend.justification = c(1, 1),
+    legend.background = element_rect(fill = scales::alpha("white", 0.7), color = NA),
+    legend.key = element_rect(fill = NA, color = NA)
+  )
+
+show(savePlot)
+
+savePaperFig(savePlot, "exp2_decayCurves.pdf", width = 20, height = 10)
+```
+
+Posterior contrast SS - DS of the decay functions,
+$\delta_{\text{SS}}(\Delta t) - \delta_{\text{DS}}(\Delta t)$, with the
+posterior mean and the 80% and 95% HPDIs at each retention interval.
+
+```{r, fig.width = 20 / 2.54, fig.height = 8 / 2.54}
+decayContrast <- lapply(deltaT, function(dt) {
+  v <- a2 / (a2 + dt^b2) - a1 / (a1 + dt^b1)    # per-draw contrast
+  h95 <- bayestestR::hdi(v, ci = 0.95)
+  h80 <- bayestestR::hdi(v, ci = 0.80)
+  tibble(
+    deltaT = dt,
+    mean   = mean(v),
+    lo80   = h80$CI_low,
+    hi80   = h80$CI_high,
+    lo95   = h95$CI_low,
+    hi95   = h95$CI_high
+  )
+}) |> bind_rows()
+
+decayContrastFig <- ggplot(decayContrast, aes(x = deltaT)) +
+  geom_ribbon(aes(ymin = lo95, ymax = hi95), fill = "grey75", alpha = 0.6) +
+  geom_ribbon(aes(ymin = lo80, ymax = hi80), fill = "grey55", alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.3) +
+  geom_line(aes(y = mean), linewidth = 0.8) +
+  labs(x = "Retention Interval (s)",
+       y = expression(delta[SS](Delta * t) - delta[DS](Delta * t))) +
+  theme_paper()
+
+show(decayContrastFig)
+
+savePaperFig(decayContrastFig, "exp2_decayContrast.pdf", width = 20, height = 8)
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
